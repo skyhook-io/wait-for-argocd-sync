@@ -5,55 +5,58 @@ Wait for ArgoCD-managed workloads to sync and become ready by monitoring resourc
 ## Features
 
 - **Cluster-level monitoring** - Works regardless of where ArgoCD Application CRD lives
-- **Version tracking** - Wait for specific `app.kubernetes.io/version` label
-- **Deployment ID tracking** - Wait for specific `deployment-id` annotation (GitHub run ID)
-- **No false positives** - Matches on expected values before checking rollout status
-- **Flexible selectors** - Use app name or custom label selectors
+- **Multiple detection strategies** - deployment-id, version label, or generation change
+- **Fallback handling** - Detects if sync already completed before action started
+- **No false positives** - Confirms actual change before proceeding
 
 ## Usage
 
 ```yaml
+# Recommended: with expected deployment-id (most reliable)
+- name: Wait for ArgoCD sync
+  uses: skyhook-io/wait-for-argocd-sync@v1
+  with:
+    app_name: my-app
+    namespace: production
+    expected_deployment_id: ${{ github.run_id }}
+    timeout: 5m
+
+# Alternative: with expected version
 - name: Wait for ArgoCD sync
   uses: skyhook-io/wait-for-argocd-sync@v1
   with:
     app_name: my-app
     namespace: production
     expected_version: ${{ inputs.tag }}
-    expected_deployment_id: ${{ github.run_id }}
     timeout: 5m
 ```
 
-## How It Works
+## Detection Strategies
+
+The action uses different strategies based on what inputs are provided:
+
+| Inputs Provided | Strategy | How It Works |
+|-----------------|----------|--------------|
+| `expected_deployment_id` | **Exact match** | Wait for deployment-id annotation to equal expected value |
+| `expected_version` (differs from current) | **Version match** | Wait for version label to equal expected value + confirm change |
+| `expected_version` (same as current) | **Change detection** | Wait for deployment-id or generation to change |
+| None | **Fallback** | Wait for change, or after 180s check if already synced |
+
+### Why deployment-id is Most Reliable
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 1: Wait for expected metadata                              │
-│   - Poll deployments with label app.kubernetes.io/name=<app>   │
-│   - Wait until version OR deployment-id matches expected value │
-│   - This confirms ArgoCD has synced the new manifests          │
-├─────────────────────────────────────────────────────────────────┤
-│ Step 2: Wait for rollouts                                       │
-│   - kubectl rollout status for each workload                   │
-│   - Track successes and failures                                │
-├─────────────────────────────────────────────────────────────────┤
-│ Step 3: Report results                                          │
-│   - Output status and match info                                │
-│   - Generate GitHub Actions summary                             │
-└─────────────────────────────────────────────────────────────────┘
+Scenario: Config-only change (version stays same)
+
+Without deployment-id:
+  1. CI commits config change
+  2. ArgoCD syncs (version unchanged)
+  3. Action can't tell if sync happened → waits 180s fallback
+
+With deployment-id:
+  1. CI commits config change with deployment-id=12345
+  2. ArgoCD syncs (deployment-id=12345)
+  3. Action sees match → proceeds immediately ✅
 ```
-
-## Why Both Version AND Deployment ID?
-
-| Change Type | Version Label | Deployment ID |
-|-------------|---------------|---------------|
-| Image change | ✅ Changes | ✅ Changes |
-| Config-only change | ❌ Same | ✅ Changes |
-| Env vars change | ❌ Same | ✅ Changes |
-
-By checking **either** matches, we catch all deployment types:
-- Image updates → version label changes
-- Config updates → deployment-id annotation changes
-- Both → both change
 
 ## Inputs
 
@@ -61,10 +64,11 @@ By checking **either** matches, we catch all deployment types:
 |-------|-------------|----------|---------|
 | `app_name` | Application name (label selector) | Yes | - |
 | `namespace` | Target namespace | Yes | - |
-| `expected_version` | Expected `app.kubernetes.io/version` value | No | - |
 | `expected_deployment_id` | Expected `deployment-id` annotation | No | - |
+| `expected_version` | Expected `app.kubernetes.io/version` label | No | - |
 | `selector` | Custom label selector (overrides app_name) | No | - |
 | `timeout` | Total timeout (e.g., 300s, 5m) | No | `300s` |
+| `fallback_timeout` | Time before fallback check (e.g., 180s, 3m) | No | `180s` |
 | `workload_types` | Workload types to wait for | No | `deployment,statefulset,daemonset` |
 
 ## Outputs
@@ -75,12 +79,41 @@ By checking **either** matches, we catch all deployment types:
 | `workloads_ready` | Number ready after rollout | `2` |
 | `version_matched` | Version match result | `true`, `false`, `skipped` |
 | `deployment_id_matched` | Deployment ID match result | `true`, `false`, `skipped` |
+| `sync_detection_method` | How sync was detected | `expected_match`, `change_detected`, `already_synced` |
 | `status` | Final status | `Ready`, `Failed`, `Timeout` |
 | `message` | Status message | `All 2 workloads are ready` |
 
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 0: Capture initial state                                   │
+│   - Record deployment-id, generation, version for each workload│
+│   - Determine detection strategy based on inputs               │
+├─────────────────────────────────────────────────────────────────┤
+│ Step 1: Wait for sync indication                                │
+│                                                                 │
+│   Strategy: expected_deployment_id                              │
+│     → Wait for deployment-id == expected (immediate if match)  │
+│                                                                 │
+│   Strategy: expected_version                                    │
+│     → Wait for version == expected + confirm change            │
+│                                                                 │
+│   Strategy: change detection                                    │
+│     → Wait for deployment-id or generation to change           │
+│                                                                 │
+│   Strategy: fallback (no expected values)                       │
+│     → Wait for change, OR after 180s if all rollouts complete  │
+│       assume sync already happened                              │
+├─────────────────────────────────────────────────────────────────┤
+│ Step 2: Wait for rollouts                                       │
+│   - kubectl rollout status for each workload                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ## Examples
 
-### Standard Deployment (Recommended)
+### With Skyhook Deploy Actions (Recommended)
 
 ```yaml
 - name: Deploy
@@ -95,7 +128,6 @@ By checking **either** matches, we catch all deployment types:
   with:
     app_name: my-service
     namespace: ${{ steps.deploy.outputs.namespace }}
-    expected_version: ${{ inputs.tag }}
     expected_deployment_id: ${{ github.run_id }}
     timeout: 5m
 ```
@@ -111,39 +143,18 @@ By checking **either** matches, we catch all deployment types:
     expected_version: main_2025-12-10_00
 ```
 
-### Config Change Only
+### Without Expected Values (Fallback Mode)
+
+Waits up to 180s for changes, then checks if rollouts are complete:
 
 ```yaml
-- name: Wait for config update
+- name: Wait for sync
   uses: skyhook-io/wait-for-argocd-sync@v1
   with:
     app_name: backend-api
     namespace: production
-    expected_deployment_id: ${{ github.run_id }}
-```
-
-### No Expected Values (Legacy Mode)
-
-If no expected values provided, falls back to finding workloads and waiting for rollout:
-
-```yaml
-- name: Wait for any rollout
-  uses: skyhook-io/wait-for-argocd-sync@v1
-  with:
-    app_name: backend-api
-    namespace: production
-```
-
-### Custom Label Selector
-
-```yaml
-- name: Wait by custom labels
-  uses: skyhook-io/wait-for-argocd-sync@v1
-  with:
-    app_name: my-app
-    namespace: production
-    selector: "team=platform,component=api"
-    expected_deployment_id: ${{ github.run_id }}
+    timeout: 10m
+    fallback_timeout: 3m  # ArgoCD default sync interval
 ```
 
 ### Complete CI/CD Flow
@@ -193,38 +204,32 @@ jobs:
         with:
           app_name: myapp
           namespace: prod
-          expected_version: ${{ needs.build.outputs.tag }}
           expected_deployment_id: ${{ github.run_id }}
+          expected_version: ${{ needs.build.outputs.tag }}
           timeout: 10m
 
       - name: Run smoke tests
         run: ./scripts/smoke-test.sh
 ```
 
-## Label Discovery
+## Labels and Annotations
 
-The action finds workloads using the standard Kubernetes label:
+The action looks for these on workloads:
 
-```yaml
-app.kubernetes.io/name: <app_name>
-```
+**Labels:**
+- `app.kubernetes.io/name` - Used for workload discovery (selector)
+- `app.kubernetes.io/version` - Compared against `expected_version`
 
-And checks for:
-```yaml
-# Label (set by kustomize-edit)
-app.kubernetes.io/version: <expected_version>
+**Annotations:**
+- `deployment-id` - Compared against `expected_deployment_id`
 
-# Annotation (set by kustomize-deploy)
-deployment-id: <expected_deployment_id>
-```
+These are set automatically by `skyhook-io/kustomize-deploy` and `skyhook-io/kustomize-edit`.
 
 ## Prerequisites
 
 - Kubernetes cluster access (configured kubectl)
 - ArgoCD managing the target workloads
 - Workloads labeled with `app.kubernetes.io/name`
-- For version matching: `app.kubernetes.io/version` label set by your deploy pipeline
-- For deployment-id matching: `deployment-id` annotation set by your deploy pipeline
 
 ## Error Handling
 
@@ -240,5 +245,5 @@ deployment-id: <expected_deployment_id>
 | Feature | wait-for-deployment | wait-for-argocd-sync |
 |---------|---------------------|----------------------|
 | Input format | JSON workloads array | Label selector |
-| ArgoCD awareness | None (race condition) | Version/ID matching |
+| ArgoCD awareness | None (race condition possible) | Full (deployment-id, version, fallback) |
 | Use case | Direct kubectl apply | GitOps deployments |

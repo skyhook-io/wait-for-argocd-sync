@@ -29,6 +29,10 @@ inputs:
     description: 'Total timeout for waiting (e.g., 300s, 5m, 10m)'
     required: false
     default: '300s'
+  fallback_timeout:
+    description: 'Time to wait for changes before checking if already synced (e.g., 180s, 3m). Only used when no expected values provided.'
+    required: false
+    default: '180s'
   workload_types:
     description: 'Comma-separated workload types to wait for (deployment,statefulset,daemonset)'
     required: false
@@ -47,6 +51,9 @@ outputs:
   deployment_id_matched:
     description: 'Whether expected deployment-id was found (true/false/skipped)'
     value: ${{ steps.wait.outputs.deployment_id_matched }}
+  sync_detection_method:
+    description: 'How sync was detected (expected_match, change_detected, already_synced)'
+    value: ${{ steps.wait.outputs.sync_detection_method }}
   status:
     description: 'Final status (Ready, Timeout, Failed)'
     value: ${{ steps.wait.outputs.status }}
@@ -76,6 +83,7 @@ runs:
         EXPECTED_VERSION='${{ inputs.expected_version }}'
         EXPECTED_DEPLOY_ID='${{ inputs.expected_deployment_id }}'
         TIMEOUT='${{ inputs.timeout }}'
+        FALLBACK_TIMEOUT='${{ inputs.fallback_timeout }}'
         WORKLOAD_TYPES='${{ inputs.workload_types }}'
 
         # Build selector
@@ -106,22 +114,20 @@ runs:
         }
 
         TIMEOUT_SECS=$(parse_timeout "$TIMEOUT")
+        FALLBACK_TIMEOUT_SECS=$(parse_timeout "$FALLBACK_TIMEOUT")
         START_TIME=$(date +%s)
 
-        # Check if we have expected values to match
-        HAS_EXPECTED_VALUES="false"
-        if [ -n "$EXPECTED_VERSION" ] || [ -n "$EXPECTED_DEPLOY_ID" ]; then
-          HAS_EXPECTED_VALUES="true"
-        fi
-
         # ============================================================
-        # STEP 0: Capture initial state (deployment-ids) to detect change
+        # STEP 0: Capture initial state
         # ============================================================
         echo ""
         echo "📋 Step 0: Capturing initial state..."
 
         declare -A INITIAL_DEPLOY_IDS
+        declare -A INITIAL_GENERATIONS
+        declare -A INITIAL_VERSIONS
         INITIAL_WORKLOADS_FOUND=0
+        HAS_DEPLOY_IDS="false"
 
         for TYPE in $(echo "$WORKLOAD_TYPES" | tr ',' ' '); do
           RESOURCES=$(kubectl get "$TYPE" -n "$NAMESPACE" -l "$SELECTOR" -o json 2>/dev/null || echo '{"items":[]}')
@@ -131,10 +137,16 @@ runs:
             NAME=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.name")
             DEPLOY_ID=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.annotations[\"deployment-id\"] // \"\"")
             VERSION=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.labels[\"app.kubernetes.io/version\"] // \"\"")
+            GENERATION=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.generation // \"0\"")
             KEY="${TYPE}/${NAME}"
+
             INITIAL_DEPLOY_IDS["$KEY"]="$DEPLOY_ID"
+            INITIAL_GENERATIONS["$KEY"]="$GENERATION"
+            INITIAL_VERSIONS["$KEY"]="$VERSION"
             INITIAL_WORKLOADS_FOUND=$((INITIAL_WORKLOADS_FOUND + 1))
-            echo "  $KEY: version=$VERSION, deployment-id=$DEPLOY_ID"
+
+            [ -n "$DEPLOY_ID" ] && HAS_DEPLOY_IDS="true"
+            echo "  $KEY: version=$VERSION, deployment-id=$DEPLOY_ID, generation=$GENERATION"
           done
         done
 
@@ -142,22 +154,64 @@ runs:
           echo "  No workloads found yet (may be created by sync)"
         fi
 
+        # Determine detection strategy
+        DETECTION_STRATEGY="fallback"
+        if [ -n "$EXPECTED_DEPLOY_ID" ]; then
+          DETECTION_STRATEGY="expected_deployment_id"
+          echo ""
+          echo "📌 Strategy: Wait for deployment-id=$EXPECTED_DEPLOY_ID"
+        elif [ -n "$EXPECTED_VERSION" ]; then
+          # Check if version already matches
+          VERSION_ALREADY_MATCHES="false"
+          for KEY in "${!INITIAL_VERSIONS[@]}"; do
+            if [ "${INITIAL_VERSIONS[$KEY]}" == "$EXPECTED_VERSION" ]; then
+              VERSION_ALREADY_MATCHES="true"
+              break
+            fi
+          done
+
+          if [ "$VERSION_ALREADY_MATCHES" == "true" ]; then
+            # Version matches - need to detect change via deployment-id or generation
+            if [ "$HAS_DEPLOY_IDS" == "true" ]; then
+              DETECTION_STRATEGY="deployment_id_change"
+              echo ""
+              echo "📌 Strategy: Version already matches, waiting for deployment-id change"
+            else
+              DETECTION_STRATEGY="generation_change"
+              echo ""
+              echo "📌 Strategy: Version already matches, waiting for generation change"
+            fi
+          else
+            DETECTION_STRATEGY="expected_version"
+            echo ""
+            echo "📌 Strategy: Wait for version=$EXPECTED_VERSION"
+          fi
+        else
+          # No expected values - use fallback with change detection
+          if [ "$HAS_DEPLOY_IDS" == "true" ]; then
+            DETECTION_STRATEGY="deployment_id_change_fallback"
+            echo ""
+            echo "📌 Strategy: Wait for deployment-id change (fallback after ${FALLBACK_TIMEOUT_SECS}s)"
+          else
+            DETECTION_STRATEGY="generation_change_fallback"
+            echo ""
+            echo "📌 Strategy: Wait for generation change (fallback after ${FALLBACK_TIMEOUT_SECS}s)"
+          fi
+        fi
+
         # ============================================================
-        # STEP 1: Wait for workloads with expected version/deployment-id
-        #         AND ensure deployment-id has changed from initial state
+        # STEP 1: Wait for sync indication
         # ============================================================
         echo ""
-        if [ "$HAS_EXPECTED_VALUES" == "true" ]; then
-          echo "⏳ Step 1: Waiting for new deployment with expected metadata..."
-        else
-          echo "⏳ Step 1: Waiting for deployment-id to change (no expected values provided)..."
-        fi
+        echo "⏳ Step 1: Waiting for sync..."
 
         VERSION_MATCHED="skipped"
         DEPLOY_ID_MATCHED="skipped"
+        SYNC_DETECTION_METHOD=""
         WORKLOADS_FOUND=0
         MATCHED_WORKLOADS=""
         LAST_LOG_TIME=0
+        FALLBACK_CHECK_DONE="false"
 
         while true; do
           CURRENT_TIME=$(date +%s)
@@ -169,8 +223,9 @@ runs:
             echo "workloads_ready=0" >> $GITHUB_OUTPUT
             echo "version_matched=$VERSION_MATCHED" >> $GITHUB_OUTPUT
             echo "deployment_id_matched=$DEPLOY_ID_MATCHED" >> $GITHUB_OUTPUT
+            echo "sync_detection_method=timeout" >> $GITHUB_OUTPUT
             echo "status=Timeout" >> $GITHUB_OUTPUT
-            echo "message=Timeout waiting for expected metadata" >> $GITHUB_OUTPUT
+            echo "message=Timeout waiting for sync" >> $GITHUB_OUTPUT
             exit 1
           fi
 
@@ -180,6 +235,8 @@ runs:
           ANY_VERSION_MATCH="false"
           ANY_DEPLOY_ID_MATCH="false"
           ANY_DEPLOY_ID_CHANGED="false"
+          ANY_GENERATION_CHANGED="false"
+          ALL_ROLLOUTS_COMPLETE="true"
 
           for TYPE in $(echo "$WORKLOAD_TYPES" | tr ',' ' '); do
             RESOURCES=$(kubectl get "$TYPE" -n "$NAMESPACE" -l "$SELECTOR" -o json 2>/dev/null || echo '{"items":[]}')
@@ -189,6 +246,10 @@ runs:
               NAME=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.name")
               CURRENT_VERSION=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.labels[\"app.kubernetes.io/version\"] // \"\"")
               CURRENT_DEPLOY_ID=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.annotations[\"deployment-id\"] // \"\"")
+              CURRENT_GENERATION=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.generation // \"0\"")
+              OBSERVED_GENERATION=$(echo "$RESOURCES" | jq -r ".items[$i].status.observedGeneration // \"0\"")
+              READY_REPLICAS=$(echo "$RESOURCES" | jq -r ".items[$i].status.readyReplicas // 0")
+              DESIRED_REPLICAS=$(echo "$RESOURCES" | jq -r ".items[$i].spec.replicas // 1")
 
               KEY="${TYPE}/${NAME}"
               WORKLOADS_FOUND=$((WORKLOADS_FOUND + 1))
@@ -197,6 +258,12 @@ runs:
               INITIAL_ID="${INITIAL_DEPLOY_IDS[$KEY]:-}"
               if [ -n "$CURRENT_DEPLOY_ID" ] && [ "$CURRENT_DEPLOY_ID" != "$INITIAL_ID" ]; then
                 ANY_DEPLOY_ID_CHANGED="true"
+              fi
+
+              # Check if generation changed from initial
+              INITIAL_GEN="${INITIAL_GENERATIONS[$KEY]:-0}"
+              if [ "$CURRENT_GENERATION" != "$INITIAL_GEN" ]; then
+                ANY_GENERATION_CHANGED="true"
               fi
 
               # Check version match
@@ -213,54 +280,81 @@ runs:
                 fi
               fi
 
-              MATCHED_WORKLOADS="${MATCHED_WORKLOADS}${KEY}|${CURRENT_VERSION}|${CURRENT_DEPLOY_ID}|${INITIAL_ID}\n"
+              # Check if rollout is complete (for fallback detection)
+              if [ "$OBSERVED_GENERATION" != "$CURRENT_GENERATION" ] || [ "$READY_REPLICAS" != "$DESIRED_REPLICAS" ]; then
+                ALL_ROLLOUTS_COMPLETE="false"
+              fi
+
+              MATCHED_WORKLOADS="${MATCHED_WORKLOADS}${KEY}|${CURRENT_VERSION}|${CURRENT_DEPLOY_ID}|${CURRENT_GENERATION}|${OBSERVED_GENERATION}|${READY_REPLICAS}/${DESIRED_REPLICAS}\n"
             done
           done
 
-          # Determine if we should proceed
+          # Determine if we should proceed based on strategy
           SHOULD_PROCEED="false"
 
-          if [ "$HAS_EXPECTED_VALUES" == "false" ]; then
-            # No expected values: just wait for deployment-id to change
-            if [ "$ANY_DEPLOY_ID_CHANGED" == "true" ]; then
-              SHOULD_PROCEED="true"
-              echo "  ✅ Detected deployment-id change"
-            elif [ $INITIAL_WORKLOADS_FOUND -eq 0 ] && [ $WORKLOADS_FOUND -gt 0 ]; then
-              # New workloads appeared (first deployment)
-              SHOULD_PROCEED="true"
-              echo "  ✅ New workloads detected"
-            fi
-          else
-            # Have expected values: need BOTH change AND match
-            MATCH_FOUND="false"
-
-            if [ -n "$EXPECTED_VERSION" ] && [ "$ANY_VERSION_MATCH" == "true" ]; then
-              MATCH_FOUND="true"
-              VERSION_MATCHED="true"
-            elif [ -n "$EXPECTED_VERSION" ]; then
-              VERSION_MATCHED="false"
-            fi
-
-            if [ -n "$EXPECTED_DEPLOY_ID" ] && [ "$ANY_DEPLOY_ID_MATCH" == "true" ]; then
-              MATCH_FOUND="true"
-              DEPLOY_ID_MATCHED="true"
-            elif [ -n "$EXPECTED_DEPLOY_ID" ]; then
-              DEPLOY_ID_MATCHED="false"
-            fi
-
-            # Must have a match AND either:
-            # - deployment-id changed (confirming this is a new deployment)
-            # - deployment-id matches expected (explicit confirmation)
-            # - this is a new workload (wasn't in initial state)
-            if [ "$MATCH_FOUND" == "true" ]; then
-              if [ "$ANY_DEPLOY_ID_CHANGED" == "true" ] || [ "$DEPLOY_ID_MATCHED" == "true" ]; then
+          case "$DETECTION_STRATEGY" in
+            "expected_deployment_id")
+              if [ "$ANY_DEPLOY_ID_MATCH" == "true" ]; then
                 SHOULD_PROCEED="true"
-                echo "  ✅ Found matching workload(s) with confirmed new deployment!"
-                [ "$VERSION_MATCHED" == "true" ] && echo "     Version matched: $EXPECTED_VERSION"
-                [ "$DEPLOY_ID_MATCHED" == "true" ] && echo "     Deployment-id matched: $EXPECTED_DEPLOY_ID"
-                [ "$ANY_DEPLOY_ID_CHANGED" == "true" ] && echo "     Deployment-id changed from initial"
+                DEPLOY_ID_MATCHED="true"
+                SYNC_DETECTION_METHOD="expected_match"
+                echo "  ✅ Deployment-id matched: $EXPECTED_DEPLOY_ID"
+              fi
+              ;;
+
+            "expected_version")
+              if [ "$ANY_VERSION_MATCH" == "true" ]; then
+                # Version matches - but also need confirmation it's a new deployment
+                if [ "$ANY_DEPLOY_ID_CHANGED" == "true" ] || [ "$ANY_GENERATION_CHANGED" == "true" ] || [ $INITIAL_WORKLOADS_FOUND -eq 0 ]; then
+                  SHOULD_PROCEED="true"
+                  VERSION_MATCHED="true"
+                  SYNC_DETECTION_METHOD="expected_match"
+                  echo "  ✅ Version matched: $EXPECTED_VERSION (with confirmed change)"
+                fi
+              fi
+              ;;
+
+            "deployment_id_change"|"deployment_id_change_fallback")
+              if [ "$ANY_DEPLOY_ID_CHANGED" == "true" ]; then
+                SHOULD_PROCEED="true"
+                SYNC_DETECTION_METHOD="change_detected"
+                echo "  ✅ Deployment-id changed from initial"
+                [ -n "$EXPECTED_VERSION" ] && [ "$ANY_VERSION_MATCH" == "true" ] && VERSION_MATCHED="true"
+              fi
+              ;;
+
+            "generation_change"|"generation_change_fallback")
+              if [ "$ANY_GENERATION_CHANGED" == "true" ]; then
+                SHOULD_PROCEED="true"
+                SYNC_DETECTION_METHOD="change_detected"
+                echo "  ✅ Generation changed from initial"
+                [ -n "$EXPECTED_VERSION" ] && [ "$ANY_VERSION_MATCH" == "true" ] && VERSION_MATCHED="true"
+              fi
+              ;;
+          esac
+
+          # Fallback check: if no change detected after fallback_timeout, check if already synced
+          if [ "$SHOULD_PROCEED" == "false" ] && [[ "$DETECTION_STRATEGY" == *"_fallback" ]] && [ "$FALLBACK_CHECK_DONE" == "false" ]; then
+            if [ $ELAPSED -ge $FALLBACK_TIMEOUT_SECS ]; then
+              FALLBACK_CHECK_DONE="true"
+              echo ""
+              echo "  ⏰ Fallback timeout reached (${FALLBACK_TIMEOUT_SECS}s), checking if already synced..."
+
+              if [ $WORKLOADS_FOUND -gt 0 ] && [ "$ALL_ROLLOUTS_COMPLETE" == "true" ]; then
+                SHOULD_PROCEED="true"
+                SYNC_DETECTION_METHOD="already_synced"
+                echo "  ✅ All workloads appear ready - assuming sync already completed"
+              else
+                echo "  ⏳ Workloads not ready yet, continuing to wait..."
               fi
             fi
+          fi
+
+          # New workloads appeared (first deployment)
+          if [ "$SHOULD_PROCEED" == "false" ] && [ $INITIAL_WORKLOADS_FOUND -eq 0 ] && [ $WORKLOADS_FOUND -gt 0 ]; then
+            SHOULD_PROCEED="true"
+            SYNC_DETECTION_METHOD="new_workloads"
+            echo "  ✅ New workloads detected"
           fi
 
           if [ "$SHOULD_PROCEED" == "true" ]; then
@@ -270,13 +364,12 @@ runs:
           # Log current state periodically (every 10 seconds)
           if [ $((ELAPSED - LAST_LOG_TIME)) -ge 10 ]; then
             LAST_LOG_TIME=$ELAPSED
-            echo "  [$ELAPSED/${TIMEOUT_SECS}s] Waiting... (found $WORKLOADS_FOUND workloads)"
+            REMAINING=$((TIMEOUT_SECS - ELAPSED))
+            echo "  [$ELAPSED/${TIMEOUT_SECS}s] Waiting... (found $WORKLOADS_FOUND workloads, ${REMAINING}s remaining)"
             if [ $WORKLOADS_FOUND -gt 0 ]; then
-              echo -e "$MATCHED_WORKLOADS" | head -3 | while IFS='|' read -r key ver did initial; do
+              echo -e "$MATCHED_WORKLOADS" | head -3 | while IFS='|' read -r key ver did gen obsgen replicas; do
                 [ -z "$key" ] && continue
-                CHANGED=""
-                [ "$did" != "$initial" ] && [ -n "$did" ] && CHANGED=" (changed!)"
-                echo "    $key: version=$ver, deployment-id=$did$CHANGED"
+                echo "    $key: v=$ver did=$did gen=$gen/$obsgen replicas=$replicas"
               done
             fi
           fi
@@ -290,6 +383,7 @@ runs:
           echo "workloads_ready=0" >> $GITHUB_OUTPUT
           echo "version_matched=$VERSION_MATCHED" >> $GITHUB_OUTPUT
           echo "deployment_id_matched=$DEPLOY_ID_MATCHED" >> $GITHUB_OUTPUT
+          echo "sync_detection_method=no_workloads" >> $GITHUB_OUTPUT
           echo "status=Ready" >> $GITHUB_OUTPUT
           echo "message=No workloads found matching selector" >> $GITHUB_OUTPUT
           exit 0
@@ -297,7 +391,7 @@ runs:
 
         echo ""
         echo "Found $WORKLOADS_FOUND workload(s):"
-        echo -e "$MATCHED_WORKLOADS" | while IFS='|' read -r key ver did initial; do
+        echo -e "$MATCHED_WORKLOADS" | while IFS='|' read -r key ver did gen obsgen replicas; do
           [ -z "$key" ] && continue
           echo "  - $key (version: $ver, deployment-id: $did)"
         done
@@ -350,6 +444,7 @@ runs:
         echo "📊 Results:"
         echo "  Workloads found: $WORKLOADS_FOUND"
         echo "  Workloads ready: $WORKLOADS_READY"
+        echo "  Detection method: $SYNC_DETECTION_METHOD"
         [ -n "$EXPECTED_VERSION" ] && echo "  Version matched: $VERSION_MATCHED"
         [ -n "$EXPECTED_DEPLOY_ID" ] && echo "  Deployment-id matched: $DEPLOY_ID_MATCHED"
 
@@ -357,6 +452,7 @@ runs:
         echo "workloads_ready=$WORKLOADS_READY" >> $GITHUB_OUTPUT
         echo "version_matched=$VERSION_MATCHED" >> $GITHUB_OUTPUT
         echo "deployment_id_matched=$DEPLOY_ID_MATCHED" >> $GITHUB_OUTPUT
+        echo "sync_detection_method=$SYNC_DETECTION_METHOD" >> $GITHUB_OUTPUT
 
         if [ "$WORKLOADS_READY" -eq "$WORKLOADS_FOUND" ]; then
           echo ""
@@ -381,6 +477,7 @@ runs:
         echo "**Application:** ${{ inputs.app_name }}" >> $GITHUB_STEP_SUMMARY
         echo "**Namespace:** ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
         echo "**Selector:** ${{ inputs.selector || format('app.kubernetes.io/name={0}', inputs.app_name) }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Detection Method:** ${{ steps.wait.outputs.sync_detection_method }}" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
         if [ -n "${{ inputs.expected_version }}" ] || [ -n "${{ inputs.expected_deployment_id }}" ]; then
