@@ -1,0 +1,405 @@
+name: 'Wait for ArgoCD Sync'
+description: 'Wait for ArgoCD-managed workloads to sync and become ready by monitoring resources directly in the target cluster'
+author: 'Skyhook'
+
+branding:
+  icon: 'refresh-cw'
+  color: 'orange'
+
+inputs:
+  app_name:
+    description: 'Application name (used as label selector: app.kubernetes.io/name=<app_name>)'
+    required: true
+  namespace:
+    description: 'Target namespace where workloads are deployed'
+    required: true
+  selector:
+    description: 'Custom label selector (overrides app_name-based selector)'
+    required: false
+    default: ''
+  expected_version:
+    description: 'Expected app.kubernetes.io/version label value (e.g., main_2025-12-10_00)'
+    required: false
+    default: ''
+  expected_deployment_id:
+    description: 'Expected deployment-id annotation value (e.g., github.run_id)'
+    required: false
+    default: ''
+  timeout:
+    description: 'Total timeout for waiting (e.g., 300s, 5m, 10m)'
+    required: false
+    default: '300s'
+  workload_types:
+    description: 'Comma-separated workload types to wait for (deployment,statefulset,daemonset)'
+    required: false
+    default: 'deployment,statefulset,daemonset'
+
+outputs:
+  workloads_found:
+    description: 'Number of workloads found matching selector'
+    value: ${{ steps.wait.outputs.workloads_found }}
+  workloads_ready:
+    description: 'Number of workloads that became ready'
+    value: ${{ steps.wait.outputs.workloads_ready }}
+  version_matched:
+    description: 'Whether expected version was found (true/false/skipped)'
+    value: ${{ steps.wait.outputs.version_matched }}
+  deployment_id_matched:
+    description: 'Whether expected deployment-id was found (true/false/skipped)'
+    value: ${{ steps.wait.outputs.deployment_id_matched }}
+  status:
+    description: 'Final status (Ready, Timeout, Failed)'
+    value: ${{ steps.wait.outputs.status }}
+  message:
+    description: 'Status message'
+    value: ${{ steps.wait.outputs.message }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check required tools
+      shell: bash
+      run: |
+        set -euo pipefail
+        command -v kubectl >/dev/null 2>&1 || { echo "::error::kubectl not found"; exit 1; }
+        command -v jq >/dev/null 2>&1 || { echo "::error::jq not found"; exit 1; }
+
+    - name: Wait for ArgoCD sync
+      id: wait
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        APP_NAME='${{ inputs.app_name }}'
+        NAMESPACE='${{ inputs.namespace }}'
+        CUSTOM_SELECTOR='${{ inputs.selector }}'
+        EXPECTED_VERSION='${{ inputs.expected_version }}'
+        EXPECTED_DEPLOY_ID='${{ inputs.expected_deployment_id }}'
+        TIMEOUT='${{ inputs.timeout }}'
+        WORKLOAD_TYPES='${{ inputs.workload_types }}'
+
+        # Build selector
+        if [ -n "$CUSTOM_SELECTOR" ]; then
+          SELECTOR="$CUSTOM_SELECTOR"
+        else
+          SELECTOR="app.kubernetes.io/name=$APP_NAME"
+        fi
+
+        echo "🔍 Selector: $SELECTOR"
+        echo "📦 Namespace: $NAMESPACE"
+        echo "⏱️  Timeout: $TIMEOUT"
+        [ -n "$EXPECTED_VERSION" ] && echo "🏷️  Expected version: $EXPECTED_VERSION"
+        [ -n "$EXPECTED_DEPLOY_ID" ] && echo "🆔 Expected deployment-id: $EXPECTED_DEPLOY_ID"
+
+        # Convert timeout to seconds
+        parse_timeout() {
+          local val="$1"
+          if [[ "$val" =~ ^([0-9]+)s$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+          elif [[ "$val" =~ ^([0-9]+)m$ ]]; then
+            echo $((${BASH_REMATCH[1]} * 60))
+          elif [[ "$val" =~ ^([0-9]+)h$ ]]; then
+            echo $((${BASH_REMATCH[1]} * 3600))
+          else
+            echo "300"
+          fi
+        }
+
+        TIMEOUT_SECS=$(parse_timeout "$TIMEOUT")
+        START_TIME=$(date +%s)
+
+        # Check if we have expected values to match
+        HAS_EXPECTED_VALUES="false"
+        if [ -n "$EXPECTED_VERSION" ] || [ -n "$EXPECTED_DEPLOY_ID" ]; then
+          HAS_EXPECTED_VALUES="true"
+        fi
+
+        # ============================================================
+        # STEP 0: Capture initial state (deployment-ids) to detect change
+        # ============================================================
+        echo ""
+        echo "📋 Step 0: Capturing initial state..."
+
+        declare -A INITIAL_DEPLOY_IDS
+        INITIAL_WORKLOADS_FOUND=0
+
+        for TYPE in $(echo "$WORKLOAD_TYPES" | tr ',' ' '); do
+          RESOURCES=$(kubectl get "$TYPE" -n "$NAMESPACE" -l "$SELECTOR" -o json 2>/dev/null || echo '{"items":[]}')
+          COUNT=$(echo "$RESOURCES" | jq '.items | length')
+
+          for i in $(seq 0 $((COUNT - 1))); do
+            NAME=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.name")
+            DEPLOY_ID=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.annotations[\"deployment-id\"] // \"\"")
+            VERSION=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.labels[\"app.kubernetes.io/version\"] // \"\"")
+            KEY="${TYPE}/${NAME}"
+            INITIAL_DEPLOY_IDS["$KEY"]="$DEPLOY_ID"
+            INITIAL_WORKLOADS_FOUND=$((INITIAL_WORKLOADS_FOUND + 1))
+            echo "  $KEY: version=$VERSION, deployment-id=$DEPLOY_ID"
+          done
+        done
+
+        if [ $INITIAL_WORKLOADS_FOUND -eq 0 ]; then
+          echo "  No workloads found yet (may be created by sync)"
+        fi
+
+        # ============================================================
+        # STEP 1: Wait for workloads with expected version/deployment-id
+        #         AND ensure deployment-id has changed from initial state
+        # ============================================================
+        echo ""
+        if [ "$HAS_EXPECTED_VALUES" == "true" ]; then
+          echo "⏳ Step 1: Waiting for new deployment with expected metadata..."
+        else
+          echo "⏳ Step 1: Waiting for deployment-id to change (no expected values provided)..."
+        fi
+
+        VERSION_MATCHED="skipped"
+        DEPLOY_ID_MATCHED="skipped"
+        WORKLOADS_FOUND=0
+        MATCHED_WORKLOADS=""
+        LAST_LOG_TIME=0
+
+        while true; do
+          CURRENT_TIME=$(date +%s)
+          ELAPSED=$((CURRENT_TIME - START_TIME))
+
+          if [ $ELAPSED -ge $TIMEOUT_SECS ]; then
+            echo "::error::Timeout waiting for workloads after ${TIMEOUT_SECS}s"
+            echo "workloads_found=$WORKLOADS_FOUND" >> $GITHUB_OUTPUT
+            echo "workloads_ready=0" >> $GITHUB_OUTPUT
+            echo "version_matched=$VERSION_MATCHED" >> $GITHUB_OUTPUT
+            echo "deployment_id_matched=$DEPLOY_ID_MATCHED" >> $GITHUB_OUTPUT
+            echo "status=Timeout" >> $GITHUB_OUTPUT
+            echo "message=Timeout waiting for expected metadata" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          # Find workloads and check state
+          MATCHED_WORKLOADS=""
+          WORKLOADS_FOUND=0
+          ANY_VERSION_MATCH="false"
+          ANY_DEPLOY_ID_MATCH="false"
+          ANY_DEPLOY_ID_CHANGED="false"
+
+          for TYPE in $(echo "$WORKLOAD_TYPES" | tr ',' ' '); do
+            RESOURCES=$(kubectl get "$TYPE" -n "$NAMESPACE" -l "$SELECTOR" -o json 2>/dev/null || echo '{"items":[]}')
+            COUNT=$(echo "$RESOURCES" | jq '.items | length')
+
+            for i in $(seq 0 $((COUNT - 1))); do
+              NAME=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.name")
+              CURRENT_VERSION=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.labels[\"app.kubernetes.io/version\"] // \"\"")
+              CURRENT_DEPLOY_ID=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.annotations[\"deployment-id\"] // \"\"")
+
+              KEY="${TYPE}/${NAME}"
+              WORKLOADS_FOUND=$((WORKLOADS_FOUND + 1))
+
+              # Check if deployment-id changed from initial
+              INITIAL_ID="${INITIAL_DEPLOY_IDS[$KEY]:-}"
+              if [ -n "$CURRENT_DEPLOY_ID" ] && [ "$CURRENT_DEPLOY_ID" != "$INITIAL_ID" ]; then
+                ANY_DEPLOY_ID_CHANGED="true"
+              fi
+
+              # Check version match
+              if [ -n "$EXPECTED_VERSION" ]; then
+                if [ "$CURRENT_VERSION" == "$EXPECTED_VERSION" ]; then
+                  ANY_VERSION_MATCH="true"
+                fi
+              fi
+
+              # Check deployment-id match
+              if [ -n "$EXPECTED_DEPLOY_ID" ]; then
+                if [ "$CURRENT_DEPLOY_ID" == "$EXPECTED_DEPLOY_ID" ]; then
+                  ANY_DEPLOY_ID_MATCH="true"
+                fi
+              fi
+
+              MATCHED_WORKLOADS="${MATCHED_WORKLOADS}${KEY}|${CURRENT_VERSION}|${CURRENT_DEPLOY_ID}|${INITIAL_ID}\n"
+            done
+          done
+
+          # Determine if we should proceed
+          SHOULD_PROCEED="false"
+
+          if [ "$HAS_EXPECTED_VALUES" == "false" ]; then
+            # No expected values: just wait for deployment-id to change
+            if [ "$ANY_DEPLOY_ID_CHANGED" == "true" ]; then
+              SHOULD_PROCEED="true"
+              echo "  ✅ Detected deployment-id change"
+            elif [ $INITIAL_WORKLOADS_FOUND -eq 0 ] && [ $WORKLOADS_FOUND -gt 0 ]; then
+              # New workloads appeared (first deployment)
+              SHOULD_PROCEED="true"
+              echo "  ✅ New workloads detected"
+            fi
+          else
+            # Have expected values: need BOTH change AND match
+            MATCH_FOUND="false"
+
+            if [ -n "$EXPECTED_VERSION" ] && [ "$ANY_VERSION_MATCH" == "true" ]; then
+              MATCH_FOUND="true"
+              VERSION_MATCHED="true"
+            elif [ -n "$EXPECTED_VERSION" ]; then
+              VERSION_MATCHED="false"
+            fi
+
+            if [ -n "$EXPECTED_DEPLOY_ID" ] && [ "$ANY_DEPLOY_ID_MATCH" == "true" ]; then
+              MATCH_FOUND="true"
+              DEPLOY_ID_MATCHED="true"
+            elif [ -n "$EXPECTED_DEPLOY_ID" ]; then
+              DEPLOY_ID_MATCHED="false"
+            fi
+
+            # Must have a match AND either:
+            # - deployment-id changed (confirming this is a new deployment)
+            # - deployment-id matches expected (explicit confirmation)
+            # - this is a new workload (wasn't in initial state)
+            if [ "$MATCH_FOUND" == "true" ]; then
+              if [ "$ANY_DEPLOY_ID_CHANGED" == "true" ] || [ "$DEPLOY_ID_MATCHED" == "true" ]; then
+                SHOULD_PROCEED="true"
+                echo "  ✅ Found matching workload(s) with confirmed new deployment!"
+                [ "$VERSION_MATCHED" == "true" ] && echo "     Version matched: $EXPECTED_VERSION"
+                [ "$DEPLOY_ID_MATCHED" == "true" ] && echo "     Deployment-id matched: $EXPECTED_DEPLOY_ID"
+                [ "$ANY_DEPLOY_ID_CHANGED" == "true" ] && echo "     Deployment-id changed from initial"
+              fi
+            fi
+          fi
+
+          if [ "$SHOULD_PROCEED" == "true" ]; then
+            break
+          fi
+
+          # Log current state periodically (every 10 seconds)
+          if [ $((ELAPSED - LAST_LOG_TIME)) -ge 10 ]; then
+            LAST_LOG_TIME=$ELAPSED
+            echo "  [$ELAPSED/${TIMEOUT_SECS}s] Waiting... (found $WORKLOADS_FOUND workloads)"
+            if [ $WORKLOADS_FOUND -gt 0 ]; then
+              echo -e "$MATCHED_WORKLOADS" | head -3 | while IFS='|' read -r key ver did initial; do
+                [ -z "$key" ] && continue
+                CHANGED=""
+                [ "$did" != "$initial" ] && [ -n "$did" ] && CHANGED=" (changed!)"
+                echo "    $key: version=$ver, deployment-id=$did$CHANGED"
+              done
+            fi
+          fi
+
+          sleep 3
+        done
+
+        if [ $WORKLOADS_FOUND -eq 0 ]; then
+          echo "::warning::No workloads found matching selector: $SELECTOR"
+          echo "workloads_found=0" >> $GITHUB_OUTPUT
+          echo "workloads_ready=0" >> $GITHUB_OUTPUT
+          echo "version_matched=$VERSION_MATCHED" >> $GITHUB_OUTPUT
+          echo "deployment_id_matched=$DEPLOY_ID_MATCHED" >> $GITHUB_OUTPUT
+          echo "status=Ready" >> $GITHUB_OUTPUT
+          echo "message=No workloads found matching selector" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo ""
+        echo "Found $WORKLOADS_FOUND workload(s):"
+        echo -e "$MATCHED_WORKLOADS" | while IFS='|' read -r key ver did initial; do
+          [ -z "$key" ] && continue
+          echo "  - $key (version: $ver, deployment-id: $did)"
+        done
+
+        # ============================================================
+        # STEP 2: Wait for rollouts to complete
+        # ============================================================
+        echo ""
+        echo "🚀 Step 2: Waiting for rollouts to complete..."
+
+        WORKLOADS_READY=0
+        FAILED_WORKLOADS=""
+
+        # Re-fetch workloads to get current list
+        for TYPE in $(echo "$WORKLOAD_TYPES" | tr ',' ' '); do
+          RESOURCES=$(kubectl get "$TYPE" -n "$NAMESPACE" -l "$SELECTOR" -o json 2>/dev/null || echo '{"items":[]}')
+          COUNT=$(echo "$RESOURCES" | jq '.items | length')
+
+          for i in $(seq 0 $((COUNT - 1))); do
+            NAME=$(echo "$RESOURCES" | jq -r ".items[$i].metadata.name")
+            KEY="${TYPE}/${NAME}"
+
+            # Calculate remaining time
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            REMAINING=$((TIMEOUT_SECS - ELAPSED))
+
+            if [ $REMAINING -le 0 ]; then
+              echo "::error::Overall timeout exceeded"
+              FAILED_WORKLOADS="${FAILED_WORKLOADS}${KEY} (timeout)\n"
+              continue
+            fi
+
+            echo "  ⏳ Waiting for $KEY (timeout: ${REMAINING}s)..."
+
+            if kubectl rollout status "$KEY" -n "$NAMESPACE" --timeout="${REMAINING}s" 2>&1; then
+              echo "  ✅ $KEY is ready"
+              WORKLOADS_READY=$((WORKLOADS_READY + 1))
+            else
+              echo "  ❌ $KEY failed or timed out"
+              FAILED_WORKLOADS="${FAILED_WORKLOADS}${KEY}\n"
+            fi
+          done
+        done
+
+        # ============================================================
+        # STEP 3: Report results
+        # ============================================================
+        echo ""
+        echo "📊 Results:"
+        echo "  Workloads found: $WORKLOADS_FOUND"
+        echo "  Workloads ready: $WORKLOADS_READY"
+        [ -n "$EXPECTED_VERSION" ] && echo "  Version matched: $VERSION_MATCHED"
+        [ -n "$EXPECTED_DEPLOY_ID" ] && echo "  Deployment-id matched: $DEPLOY_ID_MATCHED"
+
+        echo "workloads_found=$WORKLOADS_FOUND" >> $GITHUB_OUTPUT
+        echo "workloads_ready=$WORKLOADS_READY" >> $GITHUB_OUTPUT
+        echo "version_matched=$VERSION_MATCHED" >> $GITHUB_OUTPUT
+        echo "deployment_id_matched=$DEPLOY_ID_MATCHED" >> $GITHUB_OUTPUT
+
+        if [ "$WORKLOADS_READY" -eq "$WORKLOADS_FOUND" ]; then
+          echo ""
+          echo "✅ All workloads are ready"
+          echo "status=Ready" >> $GITHUB_OUTPUT
+          echo "message=All $WORKLOADS_FOUND workloads are ready" >> $GITHUB_OUTPUT
+        else
+          echo ""
+          echo "::error::Some workloads failed to become ready"
+          echo -e "Failed workloads:\n$FAILED_WORKLOADS"
+          echo "status=Failed" >> $GITHUB_OUTPUT
+          echo "message=$WORKLOADS_READY of $WORKLOADS_FOUND workloads ready" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: Generate summary
+      if: always()
+      shell: bash
+      run: |
+        echo "## 🔄 ArgoCD Sync Status" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Application:** ${{ inputs.app_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Namespace:** ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Selector:** ${{ inputs.selector || format('app.kubernetes.io/name={0}', inputs.app_name) }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ -n "${{ inputs.expected_version }}" ] || [ -n "${{ inputs.expected_deployment_id }}" ]; then
+          echo "### Expected Values" >> $GITHUB_STEP_SUMMARY
+          [ -n "${{ inputs.expected_version }}" ] && echo "- **Version:** ${{ inputs.expected_version }} → ${{ steps.wait.outputs.version_matched }}" >> $GITHUB_STEP_SUMMARY
+          [ -n "${{ inputs.expected_deployment_id }}" ] && echo "- **Deployment ID:** ${{ inputs.expected_deployment_id }} → ${{ steps.wait.outputs.deployment_id_matched }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "### Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Workloads Found | ${{ steps.wait.outputs.workloads_found }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Workloads Ready | ${{ steps.wait.outputs.workloads_ready }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Status | ${{ steps.wait.outputs.status }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ steps.wait.outputs.status }}" == "Ready" ]; then
+          echo "✅ All workloads synced and ready" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ ${{ steps.wait.outputs.message }}" >> $GITHUB_STEP_SUMMARY
+        fi
